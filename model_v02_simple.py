@@ -83,6 +83,7 @@ class MutualMultiAttentionHead(nn.Module):
         self._short_residual = short_residual
         self._message_aggregation_type = message_aggregation_type
         self._head_pooling_type = head_pooling_type
+        self._device = nn.Parameter(torch.empty(0))
         self._node_query_linear = LinearLayer(
             node_in_feats,
             num_heads * node_in_feats,
@@ -133,7 +134,9 @@ class MutualMultiAttentionHead(nn.Module):
         edge_self_attention: torch.Tensor,
     ) -> torch.Tensor:
         node_attention_projection = torch.zeros(
-            [self._num_heads, g.num_nodes(), g.num_nodes()])
+            [self._num_heads, g.num_nodes(), g.num_nodes()],
+            device=self._device.device,
+        )
 
         for edge in range(g.num_edges()):
             nodes = g.find_edges(edge)
@@ -155,7 +158,9 @@ class MutualMultiAttentionHead(nn.Module):
         node_self_attention: torch.Tensor,
     ) -> torch.Tensor:
         edge_attention_projection = torch.zeros(
-            [self._num_heads, g.num_edges(), g.num_edges()])
+            [self._num_heads, g.num_edges(), g.num_edges()],
+            device=self._device.device,
+        )
 
         for node in range(lg.num_edges()):
             edges = lg.find_edges(node)
@@ -178,7 +183,7 @@ class MutualMultiAttentionHead(nn.Module):
         value: torch.Tensor,
         attention_projection: torch.Tensor,
     ):
-        adjacency = g.adj().to_dense()
+        adjacency = g.adj(ctx=self._device.device).to_dense()
 
         if self._message_aggregation_type == 'sum':
             x = attention_projection * adjacency

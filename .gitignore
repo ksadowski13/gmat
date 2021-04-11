@@ -158,3 +158,8 @@ Thumbs.db #thumbnail cache on Windows
 ### vscode ###
 .vscode
 *.code-workspace
+
+### dgl graphs ###
+/data
+*.bin
+*.pt
