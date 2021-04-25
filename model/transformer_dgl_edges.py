@@ -49,6 +49,38 @@ class LinearBlock(nn.Module):
         return x
 
 
+class BilinearBlock(nn.Module):
+    def __init__(
+        self,
+        node_in_feats: int,
+        edge_in_feats: int,
+        out_feats: int,
+        activation: str = None,
+    ):
+        super().__init__()
+        self._bilinear = nn.Bilinear(node_in_feats, edge_in_feats, out_feats)
+
+        if activation is not None:
+            if activation == 'relu':
+                self._activation = nn.ReLU()
+            elif activation == 'softplus':
+                self._activation == nn.Softplus()
+        else:
+            self._activation = None
+
+    def forward(
+        self,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        x = self._bilinear(node_inputs, edge_inputs)
+
+        if self._activation is not None:
+            x = self._activation(x)
+
+        return x
+
+
 class MessageProjection(nn.Module):
     def __init__(
         self,
@@ -88,12 +120,17 @@ class MessageProjection(nn.Module):
         elif reduce_func == 'mean':
             self._reduce_func = fn.mean('message', 'projection')
 
-    def forward(self, g: dgl.DGLGraph) -> Tuple[torch.Tensor, torch.Tensor]:
-        g.ndata['projection'] = self._node_linear(g.ndata['feat'])
+    def forward(
+        self,
+        g: dgl.DGLGraph,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        g.ndata['projection'] = self._node_linear(node_inputs)
         g.ndata['projection'] = g.ndata['projection'].view(
             -1, self._num_heads, self._node_in_feats)
 
-        g.edata['weight'] = self._edge_linear(g.edata['feat'])
+        g.edata['weight'] = self._edge_linear(edge_inputs)
         g.edata['weight'] = g.edata['weight'].view(-1, self._num_heads, 1)
 
         g.update_all(
@@ -130,12 +167,17 @@ class LinearProjection(nn.Module):
             activation=activation,
         )
 
-    def forward(self, g: dgl.DGLGraph) -> Tuple[torch.Tensor, torch.Tensor]:
-        node_projection = self._node_linear(g.ndata['feat'])
+    def forward(
+        self,
+        g: dgl.DGLGraph,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        node_projection = self._node_linear(node_inputs)
         node_projection = node_projection.view(
             -1, self._num_heads, self._node_in_feats)
 
-        edge_projection = self._edge_linear(g.edata['feat'])
+        edge_projection = self._edge_linear(edge_inputs)
         edge_projection = edge_projection.view(
             -1, self._num_heads, self._edge_in_feats)
 
@@ -195,10 +237,17 @@ class MutualMultiAttentionHead(nn.Module):
 
         return attention_score
 
-    def forward(self, g: dgl.DGLGraph) -> Tuple[torch.Tensor, torch.Tensor]:
-        node_query, edge_query = self._query_linear(g)
-        node_key, edge_key = self._key_linear(g)
-        node_value, edge_value = self._value_linear(g)
+    def forward(
+        self,
+        g: dgl.DGLGraph,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        node_query, edge_query = self._query_linear(
+            g, node_inputs, edge_inputs)
+        node_key, edge_key = self._key_linear(g, node_inputs, edge_inputs)
+        node_value, edge_value = self._value_linear(
+            g, node_inputs, edge_inputs)
 
         node_attention = self._calculate_attention_score(
             node_query, node_key, self._node_scale_const)
@@ -279,24 +328,191 @@ class MutualAttentionTransformerLayer(nn.Module):
             activation=embedding_activation,
         )
 
-    def forward(self, g: dgl.DGLGraph) -> None:
-        node_embedding, edge_embedding = self._mutual_multi_attention_head(g)
+    def forward(
+        self,
+        g: dgl.DGLGraph,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        node_embedding, edge_embedding = self._mutual_multi_attention_head(
+            g, node_inputs, edge_inputs)
 
         node_embedding = self._node_embedding_dropout_1(node_embedding)
         edge_embedding = self._edge_embedding_dropout_1(edge_embedding)
 
         if self._residual:
-            g.ndata['feat'] += node_embedding
-            g.edata['feat'] += edge_embedding
-        else:
-            g.ndata['feat'] = node_embedding
-            g.edata['feat'] = edge_embedding
+            node_embedding += node_inputs
+            edge_embedding += edge_inputs
 
-        g.ndata['feat'] = self._node_embedding_linear_1(g.ndata['feat'])
-        g.edata['feat'] = self._node_embedding_linear_1(g.edata['feat'])
+        node_embedding = self._node_embedding_linear_1(node_embedding)
+        edge_embedding = self._edge_embedding_linear_1(edge_embedding)
 
-        g.ndata['feat'] = self._node_embedding_dropout_2(g.ndata['feat'])
-        g.edata['feat'] = self._edge_embedding_dropout_2(g.edata['feat'])
+        node_embedding = self._node_embedding_dropout_2(node_embedding)
+        edge_embedding = self._edge_embedding_dropout_2(edge_embedding)
 
-        g.ndata['feat'] = self._node_embedding_linear_2(g.ndata['feat'])
-        g.edata['feat'] = self._node_embedding_linear_2(g.edata['feat'])
+        node_embedding = self._node_embedding_linear_2(node_embedding)
+        edge_embedding = self._edge_embedding_linear_2(edge_embedding)
+
+        return node_embedding, edge_embedding
+
+
+class GraphMututalAttentionTransformer(nn.Module):
+    def __init__(
+        self,
+        node_in_feats: int,
+        node_hidden_feats: int,
+        node_out_feats: int,
+        edge_in_feats: int,
+        edge_hidden_feats: int,
+        edge_out_feats: int,
+        num_layers: int,
+        num_heads: int,
+        message_func: str,
+        reduce_func: str,
+        head_pooling_func: str,
+        readout_pooling_func: str,
+        residual: bool,
+        dropout: float,
+        embedding_normalization: str = None,
+        weight_activation: str = None,
+        projection_activation: str = None,
+        embedding_activation: str = None,
+        readout_activation: str = None,
+    ):
+        super().__init__()
+        self._node_out_feats = node_out_feats
+        self._edge_out_feats = edge_out_feats
+        self._transformer_layers = self._create_transformer_layers(
+            node_in_feats,
+            node_hidden_feats,
+            node_out_feats,
+            edge_in_feats,
+            edge_hidden_feats,
+            edge_out_feats,
+            num_layers,
+            num_heads,
+            message_func,
+            reduce_func,
+            head_pooling_func,
+            residual,
+            dropout,
+            embedding_normalization,
+            weight_activation,
+            projection_activation,
+            embedding_activation,
+        )
+
+        if readout_pooling_func == 'sum':
+            self._readout_pooling = dgl.nn.pytorch.SumPooling()
+        elif readout_pooling_func == 'mean':
+            self._readout_pooling = dgl.nn.pytorch.AvgPooling()
+
+        self._bilinear = BilinearBlock(
+            node_out_feats,
+            edge_out_feats,
+            1,
+            readout_activation,
+        )
+
+    def _create_transformer_layers(
+        self,
+        node_in_feats: int,
+        node_hidden_feats: int,
+        node_out_feats: int,
+        edge_in_feats: int,
+        edge_hidden_feats: int,
+        edge_out_feats: int,
+        num_layers: int,
+        num_heads: int,
+        message_func: str,
+        reduce_func: str,
+        head_pooling_func: str,
+        residual: bool,
+        dropout: float,
+        embedding_normalization: str = None,
+        weight_activation: str = None,
+        projection_activation: str = None,
+        embedding_activation: str = None,
+    ) -> nn.ModuleList:
+        transformer_layers = nn.ModuleList()
+
+        if num_layers > 1:
+            transformer_layers.append(MutualAttentionTransformerLayer(
+                node_in_feats,
+                node_in_feats * node_hidden_feats,
+                node_hidden_feats,
+                edge_in_feats,
+                edge_in_feats * edge_hidden_feats,
+                edge_hidden_feats,
+                num_heads,
+                message_func,
+                reduce_func,
+                head_pooling_func,
+                residual,
+                dropout,
+                embedding_normalization,
+                weight_activation,
+                projection_activation,
+                embedding_activation,
+            ))
+
+            for _ in range(num_layers - 2):
+                transformer_layers.append(MutualAttentionTransformerLayer(
+                    node_hidden_feats,
+                    node_hidden_feats * node_hidden_feats,
+                    node_hidden_feats,
+                    edge_hidden_feats,
+                    edge_hidden_feats * edge_hidden_feats,
+                    edge_hidden_feats,
+                    num_heads,
+                    message_func,
+                    reduce_func,
+                    head_pooling_func,
+                    residual,
+                    dropout,
+                    embedding_normalization,
+                    weight_activation,
+                    projection_activation,
+                    embedding_activation,
+                ))
+
+            transformer_layers.append(MutualAttentionTransformerLayer(
+                node_hidden_feats,
+                node_hidden_feats * node_out_feats,
+                node_out_feats,
+                edge_hidden_feats,
+                edge_hidden_feats * edge_out_feats,
+                edge_out_feats,
+                num_heads,
+                message_func,
+                reduce_func,
+                head_pooling_func,
+                residual,
+                dropout,
+                embedding_normalization,
+                weight_activation,
+                projection_activation,
+                embedding_activation,
+            ))
+
+        return transformer_layers
+
+    def forward(
+        self,
+        g: dgl.DGLGraph,
+        node_inputs: torch.Tensor,
+        edge_inputs: torch.Tensor,
+    ) -> torch.Tensor:
+        node_embedding = node_inputs
+        edge_embedding = edge_inputs
+
+        for transformer_layer in self._transformer_layers:
+            node_embedding, edge_embedding = transformer_layer(
+                g, node_embedding, edge_embedding)
+
+        node_embedding = self._readout_pooling(g, node_embedding)
+        edge_embedding = self._readout_pooling(g.line_graph(backtracking=False), edge_embedding)
+
+        readout = self._bilinear(node_embedding, edge_embedding)
+
+        return readout
